@@ -124,9 +124,34 @@ analyzeCPAT <- function(
             }
 
 
+        } else if (ncol(myCPATresults) == 11) { # Handling CPAT3
+            # Check if the expected column names exist
+            expectedCols <- c("seq_ID", "ID", "mRNA", "ORF_strand", "ORF_frame", 
+                              "ORF_start", "ORF_end", "ORF", "Fickett", "Hexamer", "Coding_prob")
+            
+            if (all(colnames(myCPATresults) %in% expectedCols)) {
+                temp <- myCPATresults$seq_ID
+                myCPATresults <- myCPATresults[, c("mRNA", "ORF", "Fickett", "Hexamer", "Coding_prob")]
+                myCPATresults$id <- temp
+                
+                # rename to match the expected format
+                colnames(myCPATresults) <-
+                    c(
+                        'mRNA_size',
+                        'ORF_size',
+                        'Fickett_score',
+                        'Hexamer_score',
+                        'coding_prob',
+                        'id'
+                    )
+            } else {
+                stop(
+                    'There seems to be a problem with the CPAT3 result file. Expected columns not found. Please check it is the right file and try again'
+                )
+            }
         } else {
             stop(
-                'There seems to be a problem with the CPAT result file. Please check it is the rigth file and try again'
+                'There seems to be a problem with the CPAT result file. Please check it is the right file and try again'
             )
         }
         
@@ -1949,23 +1974,46 @@ analyzeIUPred2A <- function(
             )
         }
 
-        ### Read in file
+        # First, check if file is AIUPred format by examining a few lines
+        firstLines <- readLines(pathToIUPred2AresultFile[1], n = 30)
+        isAIUPred <- any(grepl("#>", firstLines))
+        hasHeaderLine <- any(grepl("Position\\tResidue\\tDisorder\\tBinding", firstLines))
+
+        ### Read in file with special handling for AIUPred format
         suppressWarnings(
             iupred2a <- do.call(rbind, plyr::llply(
                 pathToIUPred2AresultFile,
-                .fun = function(
-                    aFile
-                ) {
-                    read.table(
-                        file = aFile,
-                        header = FALSE,
-                        sep = '\t',
-                        stringsAsFactors = FALSE,
-                        strip.white = TRUE,
-                        comment.char = '#',
-                        blank.lines.skip = TRUE,
-                        fill = TRUE
-                    )
+                .fun = function(aFile) {
+                    # For AIUPred format, we need to keep #> lines but remove other comment lines
+                    if(isAIUPred) {
+                        rawLines <- readLines(aFile)
+                        # Convert #> lines to > lines for consistent processing
+                        rawLines <- gsub("^#>", ">", rawLines)
+                        # Remove comment lines that don't contain sequence IDs
+                        rawLines <- rawLines[!grepl("^#", rawLines)]
+                        # Read from text
+                        read.table(
+                            text = rawLines,
+                            header = FALSE,
+                            sep = '\t',
+                            stringsAsFactors = FALSE,
+                            strip.white = TRUE,
+                            blank.lines.skip = TRUE,
+                            fill = TRUE
+                        )
+                    } else {
+                        # Original file reading for IUPred2A format
+                        read.table(
+                            file = aFile,
+                            header = FALSE,
+                            sep = '\t',
+                            stringsAsFactors = FALSE,
+                            strip.white = TRUE,
+                            comment.char = '#',
+                            blank.lines.skip = TRUE,
+                            fill = TRUE
+                        )
+                    }
                 }
             ))
         )
@@ -1974,43 +2022,38 @@ analyzeIUPred2A <- function(
         if(TRUE) {
             ### Fix fails in reading in files
             if(TRUE) {
-                ### Remove comments
-                iupred2a <- iupred2a[which(
-                    ! grepl('^#', iupred2a$V1)
-                ),]
                 ### Remove blank lines
-                iupred2a <- iupred2a[which(
-                    ! iupred2a$V1 == ''
-                ),]
+                iupred2a <- iupred2a[which(!iupred2a$V1 == ''),]
             }
 
+            # Extract sequence IDs (now consistently prefixed with >)
             myNames <- gsub(
                 '^>',
                 '',
-                iupred2a$V1[which(is.na(iupred2a$V3))]
-            ) 
+                iupred2a$V1[which(is.na(iupred2a$V3) | grepl('^>', iupred2a$V1))]
+            )
             
             ### Fix names
-            if( ignoreAfterBar | ignoreAfterSpace | ignoreAfterPeriod){
+            if(ignoreAfterBar | ignoreAfterSpace | ignoreAfterPeriod){
                 myNames <- fixNames(
-                nameVec = myNames,
-                ignoreAfterBar = ignoreAfterBar,
-                ignoreAfterSpace = ignoreAfterSpace,
-                ignoreAfterPeriod = ignoreAfterPeriod
-              )
+                    nameVec = myNames,
+                    ignoreAfterBar = ignoreAfterBar,
+                    ignoreAfterSpace = ignoreAfterSpace,
+                    ignoreAfterPeriod = ignoreAfterPeriod
+                )
             }
 
             ### Sanity check
-            if( ! any( myNames %in% switchAnalyzeRlist$isoformFeatures$isoform_id )) {
+            if(!any(myNames %in% switchAnalyzeRlist$isoformFeatures$isoform_id)) {
                 stop('The \'pathToIUPred2AresultFile\' does not appear to contain results for the isoforms stored in the switchAnalyzeRlist...')
             }
 
-            if( annotateBindingSites ) {
-                if( ncol( iupred2a) != 4 ) {
+            if(annotateBindingSites) {
+                if(ncol(iupred2a) < 4) {
                     stop(
                         paste(
                             'It appears the file pointed to by by pathToIUPred2AresultFile',
-                            'does not contain the ANCHOR2 Predictions.',
+                            'does not contain the ANCHOR2/Binding Predictions.',
                             'Please ensure the "context-dependent predictions" is turned on and set to ANCHOR2'
                         )
                     )
@@ -2018,50 +2061,73 @@ analyzeIUPred2A <- function(
             }
 
             ### Create id vector
-            myIndex <- c(which(grepl('^>', iupred2a$V1)), nrow(iupred2a)+1)
+            idLines <- which(grepl('^>', iupred2a$V1))
+            myIndex <- c(idLines, nrow(iupred2a)+1)
+            
+            # Validate we have sufficient IDs
+            if(length(myNames) != length(idLines)) {
+                myNames <- myNames[1:length(idLines)]
+            }
+            
             newIdDf <- data.frame(
                 start = myIndex[-length(myIndex)],
-                end = myIndex[-1] -1,
+                end = myIndex[-1] - 1,
                 newId = myNames,
                 stringsAsFactors = FALSE
             )
-            newIdDf$length <- newIdDf$end - newIdDf$start + 1
+            newIdDf$length <- newIdDf$end - newIdDf$start
 
-            iupred2a$newId <- rep(
-                x = newIdDf$newId,
-                times = newIdDf$length
-            )
-            if( any(is.na(iupred2a$newId)) ) {
-                stop('Something went wrong in the convertion of to table format. Please contact developers with reproducible example')
+            # Map IDs to data rows
+            iupred2a$newId <- NA
+            for(i in 1:nrow(newIdDf)) {
+                if(newIdDf$length[i] > 0) {
+                    rowsToMap <- (newIdDf$start[i]+1):newIdDf$end[i]
+                    iupred2a$newId[rowsToMap] <- newIdDf$newId[i]
+                }
+            }
+            
+            if(any(is.na(iupred2a$newId))) {
+                # Filter out rows with ID headers or no assigned ID
+                iupred2a <- iupred2a[!is.na(iupred2a$newId),]
+                if(nrow(iupred2a) == 0) {
+                    stop('Unable to parse isoform IDs from file. Please check the file format.')
+                }
             }
 
-            ### Extract the parts of of interest
-            iupred2a <- iupred2a[which( ! grepl('^>', iupred2a$V1)),]
-            iupred2a <- iupred2a[,c(5,1:4)]
+            ### Extract the parts of interest (data rows only)
+            iupred2a <- iupred2a[which(!grepl('^>', iupred2a$V1)),]
+            iupred2a <- iupred2a[,c(ncol(iupred2a),1:4)]
 
-            colnames(iupred2a) <- c('isoform_id','position','residue','iupred_score','anchor_score')
+            ### Handle different column naming conventions
+            if(isAIUPred) {
+                # For AIUPred with columns Position, Residue, Disorder, Binding
+                colnames(iupred2a) <- c('isoform_id', 'position', 'residue', 'iupred_score', 'anchor_score')
+            } else {
+                # For original IUPred2A
+                colnames(iupred2a) <- c('isoform_id', 'position', 'residue', 'iupred_score', 'anchor_score')
+            }
 
             iupred2a$position <- as.integer(iupred2a$position)
 
             ### Sanity checks
             if(TRUE) {
                 problemsFound <- FALSE
-                if( ! is(iupred2a$iupred_score, 'numeric') ) {
+                if(!is(iupred2a$iupred_score, 'numeric')) {
                     problemsFound <- TRUE
                 }
-                if( ! is(iupred2a$anchor_score, 'numeric') ) {
+                if(!is(iupred2a$anchor_score, 'numeric')) {
                     problemsFound <- TRUE
                 }
-                if( ! all( iupred2a$residue %in% Biostrings::AA_ALPHABET ) ){
+                if(!all(iupred2a$residue %in% Biostrings::AA_ALPHABET)) {
                     problemsFound <- TRUE
                 }
                 if(problemsFound) {
-                    stop('The file(s) provided to "pathToIUPred2AresultFile" does not appear to be the result file from IUPred2A')
+                    stop('The file(s) provided to "pathToIUPred2AresultFile" does not appear to be a valid IUPred2A or AIUPred result file')
                 }
             }
         }
 
-        ### Subset to relecant features
+        ### Subset to relevant features
         iupred2a <- iupred2a[which(
             iupred2a$isoform_id %in%
                 switchAnalyzeRlist$orfAnalysis$isoform_id[which(
